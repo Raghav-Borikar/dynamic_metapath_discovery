@@ -4,6 +4,7 @@ import torch
 import argparse
 import logging
 from datetime import datetime
+from tqdm import tqdm
 
 # Import project modules
 from models.base_model import DynamicMetapathGNN
@@ -11,20 +12,20 @@ from models.relation_attention import RelationAttention
 from models.metapath_attention import MetapathAttention
 from models.expansion_criteria import ExpansionCriteria
 from utils.experiment_tracking import ExperimentTracker
+from data.dblp_dataset import DBLPGraphDataLoader
 
 
 def setup_logging():
-    """Set up logging configuration."""
+"""Set up logging configuration."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
             logging.FileHandler("project.log"),
             logging.StreamHandler()
-        ]
-    )
-    return logging.getLogger(__name__)
-
+            ]
+        )    
+    return logging.getLogger(name)
 
 def setup_environment(args):
     """Set up the development environment."""
@@ -34,15 +35,14 @@ def setup_environment(args):
     os.makedirs(args.output_dir, exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "models"), exist_ok=True)
     os.makedirs(os.path.join(args.output_dir, "results"), exist_ok=True)
-    
+
     # Set random seeds for reproducibility
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
-    
+
     logger.info(f"Environment setup complete. Using device: {args.device}")
     return args.device
-
 
 def create_model_architecture(args):
     """Create the model architecture with attention mechanisms."""
