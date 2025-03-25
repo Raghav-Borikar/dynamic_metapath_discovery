@@ -1,22 +1,34 @@
 import os
-import numpy as np
 import torch
-import matplotlib.pyplot as plt
-import networkx as nx
+import numpy as np
+import pandas as pd
+import urllib.request
+import gzip
+import shutil
+import xml.etree.ElementTree as ET
+from tqdm import tqdm
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split
-from torch.utils.data import Dataset
 
-class HeterogeneousGraphDataset:
-    """Dataset class for heterogeneous graphs with preprocessing capabilities"""
+
+class DBLPDataset:
+    """
+    DBLP heterogeneous graph dataset implementation
+    """
     
-    def __init__(self, name, raw_dir='./data/raw', processed_dir='./data/processed'):
-        self.name = name
+    def __init__(self, raw_dir='./data/raw', processed_dir='./data/processed'):
+        self.name = 'DBLP'
         self.raw_dir = raw_dir
         self.processed_dir = processed_dir
+        
+        # DBLP XML file URLs
+        self.dblp_xml_url = "https://dblp.org/xml/dblp.xml.gz"
+        self.dblp_dtd_url = "https://dblp.org/xml/dblp.dtd"
         
         # Create directories
         os.makedirs(raw_dir, exist_ok=True)
         os.makedirs(processed_dir, exist_ok=True)
+        os.makedirs('./data/visualizations', exist_ok=True)
         
         # Graph data structures
         self.node_types = []
@@ -26,31 +38,208 @@ class HeterogeneousGraphDataset:
         self.node_labels = {}
         
     def download(self):
-        """Download dataset from source"""
-        print(f"Downloading {self.name} dataset...")
-        # Implementation depends on specific dataset source
-        # For academic datasets like DBLP, ACM, etc.
+        """Download DBLP dataset if not exists"""
+        print("Downloading DBLP dataset...")
         
-    def process(self):
-        """Process raw data into heterogeneous graph format"""
-        print(f"Processing {self.name} dataset...")
+        # Download XML file
+        xml_gz_path = os.path.join(self.raw_dir, "dblp.xml.gz")
+        xml_path = os.path.join(self.raw_dir, "dblp.xml")
+        dtd_path = os.path.join(self.raw_dir, "dblp.dtd")
         
-        # Load raw data files
-        # Example implementation for academic network:
-        # - Load papers, authors, venues from CSV/JSON files
-        # - Extract node features from text/metadata
-        # - Create edge indices for different relation types
+        if not os.path.exists(xml_path):
+            if not os.path.exists(xml_gz_path):
+                print(f"Downloading DBLP XML file from {self.dblp_xml_url}")
+                urllib.request.urlretrieve(self.dblp_xml_url, xml_gz_path)
+            
+            # Extract the gzipped file
+            print("Extracting XML file...")
+            with gzip.open(xml_gz_path, 'rb') as f_in:
+                with open(xml_path, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
         
-        # Set up node types and features
-        # self.node_types = ['paper', 'author', 'venue']
-        # self.node_features['paper'] = paper_features
+        # Download DTD file
+        if not os.path.exists(dtd_path):
+            print(f"Downloading DBLP DTD file from {self.dblp_dtd_url}")
+            urllib.request.urlretrieve(self.dblp_dtd_url, dtd_path)
         
-        # Set up edge types and connections
-        # self.edge_types = [('author', 'writes', 'paper'), ('paper', 'published_in', 'venue')]
-        # self.edge_indices[('author', 'writes', 'paper')] = author_paper_edges
+        print("Download complete.")
+        
+    def process(self, max_papers=10000):
+        """Process DBLP dataset"""
+        print("Processing DBLP dataset...")
+        
+        # Define node types
+        self.node_types = ['author', 'paper', 'conference', 'term']
+        
+        # Define edge types (relations)
+        self.edge_types = [
+            ('author', 'writes', 'paper'),
+            ('paper', 'written_by', 'author'),
+            ('conference', 'publishes', 'paper'),
+            ('paper', 'published_in', 'conference'),
+            ('paper', 'contains', 'term'),
+            ('term', 'contained_in', 'paper')
+        ]
+        
+        # Check if XML file exists
+        xml_path = os.path.join(self.raw_dir, "dblp.xml")
+        if not os.path.exists(xml_path):
+            self.download()
+        
+        # Initialize data structures
+        authors = {}
+        papers = {}
+        conferences = {}
+        terms = set()
+        paper_author_edges = []
+        paper_conf_edges = []
+        paper_term_edges = []
+        
+        # Parse XML file
+        print("Parsing XML file...")
+        context = ET.iterparse(xml_path, events=('start', 'end'))
+        
+        paper_count = 0
+        current_element = None
+        
+        for event, elem in tqdm(context, desc="Parsing XML"):
+            if event == 'end' and elem.tag in ['article', 'inproceedings', 'proceedings']:
+                paper_id = elem.get('key')
+                title_elem = elem.find('title')
+                
+                if title_elem is not None and title_elem.text:
+                    title = title_elem.text.lower()
+                    papers[paper_id] = {'title': title, 'year': 0}
+                    
+                    # Extract year
+                    year_elem = elem.find('year')
+                    if year_elem is not None and year_elem.text:
+                        papers[paper_id]['year'] = int(year_elem.text)
+                    
+                    # Process authors
+                    for author_elem in elem.findall('author'):
+                        if author_elem.text:
+                            author_name = author_elem.text
+                            author_id = author_name.replace(" ", "_").lower()
+                            
+                            # Store author
+                            if author_id not in authors:
+                                authors[author_id] = author_name
+                            
+                            # Create author-paper edge
+                            paper_author_edges.append((author_id, paper_id))
+                    
+                    # Process conference/journal
+                    conf_elem = elem.find('booktitle') or elem.find('journal')
+                    if conf_elem is not None and conf_elem.text:
+                        conf_name = conf_elem.text
+                        conf_id = conf_name.replace(" ", "_").lower()
+                        
+                        # Store conference
+                        if conf_id not in conferences:
+                            conferences[conf_id] = conf_name
+                        
+                        # Create paper-conference edge
+                        paper_conf_edges.append((paper_id, conf_id))
+                    
+                    # Process terms (simple tokenization)
+                    if title:
+                        # Simple preprocessing: lowercase, remove punctuation
+                        title_processed = ''.join(c.lower() if c.isalnum() else ' ' for c in title)
+                        title_terms = [t for t in title_processed.split() if len(t) > 3]  # Filter short terms
+                        
+                        for term in title_terms:
+                            # Store term
+                            if term not in terms:
+                                terms.add(term)
+                            
+                            # Create paper-term edge
+                            paper_term_edges.append((paper_id, term))
+                    
+                    paper_count += 1
+                    if paper_count >= max_papers:
+                        break
+                
+                # Clear element to save memory
+                elem.clear()
+            
+            # Break if we've processed enough papers
+            if paper_count >= max_papers:
+                break
+        
+        print(f"Processed {paper_count} papers, {len(authors)} authors, {len(conferences)} conferences, {len(terms)} terms")
+        
+        # Create node ID mappings
+        author_ids = {author_id: i for i, author_id in enumerate(authors.keys())}
+        paper_ids = {paper_id: i for i, paper_id in enumerate(papers.keys())}
+        conf_ids = {conf_id: i for i, conf_id in enumerate(conferences.keys())}
+        term_ids = {term: i for i, term in enumerate(terms)}
+        
+        # Create node features
+        print("Creating node features...")
+        # Author features: one-hot encoding
+        self.node_features['author'] = torch.eye(len(authors))
+        
+        # Paper features: year and TF-IDF of titles
+        paper_titles = [papers[pid]['title'] for pid in papers.keys()]
+        vectorizer = TfidfVectorizer(max_features=100)  # Limit features for memory
+        tfidf_features = vectorizer.fit_transform(paper_titles).toarray()
+        
+        # Combine year and TF-IDF features
+        paper_years = np.array([[papers[pid]['year']] for pid in papers.keys()]) / 2025.0  # Normalize
+        paper_features = np.hstack([paper_years, tfidf_features])
+        self.node_features['paper'] = torch.FloatTensor(paper_features)
+        
+        # Conference features: one-hot encoding
+        self.node_features['conference'] = torch.eye(len(conferences))
+        
+        # Term features: one-hot encoding
+        self.node_features['term'] = torch.eye(len(terms))
+        
+        # Create edge indices
+        print("Creating edge indices...")
+        
+        # Author-Paper edges
+        author_to_paper = []
+        paper_to_author = []
+        for author_id, paper_id in paper_author_edges:
+            if author_id in author_ids and paper_id in paper_ids:
+                author_to_paper.append([author_ids[author_id], paper_ids[paper_id]])
+                paper_to_author.append([paper_ids[paper_id], author_ids[author_id]])
+        
+        self.edge_indices[('author', 'writes', 'paper')] = torch.LongTensor(author_to_paper).t() if author_to_paper else torch.zeros((2, 0), dtype=torch.long)
+        self.edge_indices[('paper', 'written_by', 'author')] = torch.LongTensor(paper_to_author).t() if paper_to_author else torch.zeros((2, 0), dtype=torch.long)
+        
+        # Conference-Paper edges
+        conf_to_paper = []
+        paper_to_conf = []
+        for paper_id, conf_id in paper_conf_edges:
+            if paper_id in paper_ids and conf_id in conf_ids:
+                conf_to_paper.append([conf_ids[conf_id], paper_ids[paper_id]])
+                paper_to_conf.append([paper_ids[paper_id], conf_ids[conf_id]])
+        
+        self.edge_indices[('conference', 'publishes', 'paper')] = torch.LongTensor(conf_to_paper).t() if conf_to_paper else torch.zeros((2, 0), dtype=torch.long)
+        self.edge_indices[('paper', 'published_in', 'conference')] = torch.LongTensor(paper_to_conf).t() if paper_to_conf else torch.zeros((2, 0), dtype=torch.long)
+        
+        # Paper-Term edges
+        paper_to_term = []
+        term_to_paper = []
+        for paper_id, term in paper_term_edges:
+            if paper_id in paper_ids and term in term_ids:
+                paper_to_term.append([paper_ids[paper_id], term_ids[term]])
+                term_to_paper.append([term_ids[term], paper_ids[paper_id]])
+        
+        self.edge_indices[('paper', 'contains', 'term')] = torch.LongTensor(paper_to_term).t() if paper_to_term else torch.zeros((2, 0), dtype=torch.long)
+        self.edge_indices[('term', 'contained_in', 'paper')] = torch.LongTensor(term_to_paper).t() if term_to_paper else torch.zeros((2, 0), dtype=torch.long)
+        
+        # Create author labels (4 research areas)
+        # For demonstration, assign random labels
+        self.node_labels['author'] = torch.randint(0, 4, (len(authors),))
         
         # Save processed data
         self.save()
+        
+        print(f"Processing complete with {sum(len(edges) for edges in self.edge_indices.values())} total edges")
         
     def save(self):
         """Save processed data to disk"""
@@ -154,230 +343,30 @@ class HeterogeneousGraphDataset:
         }
 
 
-class GraphVisualizer:
-    """Tools for visualizing heterogeneous graphs"""
-    
-    def __init__(self, dataset):
-        self.dataset = dataset
-        
-    def visualize_graph_statistics(self):
-        """Visualize basic statistics of the heterogeneous graph"""
-        # Node type distribution
-        node_counts = {ntype: len(self.dataset.get_node_features(ntype)) 
-                      for ntype in self.dataset.node_types 
-                      if self.dataset.get_node_features(ntype) is not None}
-        
-        # Edge type distribution
-        edge_counts = {etype: self.dataset.get_edge_indices(etype).shape[1] 
-                      for etype in self.dataset.edge_types
-                      if self.dataset.get_edge_indices(etype) is not None}
-        
-        # Create plots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Node type distribution
-        ax1.bar(node_counts.keys(), node_counts.values())
-        ax1.set_title('Node Type Distribution')
-        ax1.set_ylabel('Count')
-        ax1.tick_params(axis='x', rotation=45)
-        
-        # Edge type distribution
-        ax2.bar(edge_counts.keys(), edge_counts.values())
-        ax2.set_title('Edge Type Distribution')
-        ax2.set_ylabel('Count')
-        ax2.tick_params(axis='x', rotation=45)
-        
-        plt.tight_layout()
-        plt.savefig(f"./data/visualizations/{self.dataset.name}_statistics.png")
-        plt.close()
-        
-    def visualize_subgraph(self, node_types=None, edge_types=None, max_nodes=100):
-        """Visualize a subgraph with specified node and edge types"""
-        if node_types is None:
-            node_types = self.dataset.node_types
-        if edge_types is None:
-            edge_types = self.dataset.edge_types
-            
-        # Create NetworkX graph
-        G = nx.Graph()
-        
-        # Add nodes
-        node_offset = 0
-        node_id_map = {}
-        
-        for ntype in node_types:
-            features = self.dataset.get_node_features(ntype)
-            if features is None:
-                continue
-                
-            num_nodes = min(len(features), max_nodes)
-            for i in range(num_nodes):
-                node_id = f"{ntype}_{i}"
-                G.add_node(node_id, type=ntype)
-                node_id_map[(ntype, i)] = node_id
-                
-        # Add edges
-        for etype in edge_types:
-            src_type, rel, dst_type = etype
-            if src_type not in node_types or dst_type not in node_types:
-                continue
-                
-            edge_indices = self.dataset.get_edge_indices(etype)
-            if edge_indices is None:
-                continue
-                
-            for i in range(min(edge_indices.shape[1], 1000)):  # Limit number of edges
-                src_idx, dst_idx = edge_indices[0, i], edge_indices[1, i]
-                
-                if (src_type, src_idx) in node_id_map and (dst_type, dst_idx) in node_id_map:
-                    src_id = node_id_map[(src_type, src_idx)]
-                    dst_id = node_id_map[(dst_type, dst_idx)]
-                    G.add_edge(src_id, dst_id, type=rel)
-        
-        # Visualize
-        plt.figure(figsize=(12, 10))
-        
-        # Node colors based on type
-        node_types_unique = list(set(nx.get_node_attributes(G, 'type').values()))
-        color_map = plt.cm.get_cmap('tab10', len(node_types_unique))
-        node_colors = [node_types_unique.index(G.nodes[node]['type']) for node in G.nodes]
-        
-        # Draw the graph
-        pos = nx.spring_layout(G, seed=42)
-        nx.draw_networkx(
-            G, pos, 
-            node_color=node_colors, 
-            cmap=color_map,
-            node_size=100,
-            with_labels=False,
-            width=0.5,
-            alpha=0.8
-        )
-        
-        # Add legend
-        plt.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', 
-                                       markerfacecolor=color_map(i), markersize=10, label=ntype) 
-                           for i, ntype in enumerate(node_types_unique)],
-                  title="Node Types")
-        
-        plt.title(f"Subgraph Visualization of {self.dataset.name}")
-        plt.axis('off')
-        plt.tight_layout()
-        plt.savefig(f"./data/visualizations/{self.dataset.name}_subgraph.png")
-        plt.close()
-        
-    def visualize_feature_distributions(self, node_type):
-        """Visualize feature distributions for a specific node type"""
-        features = self.dataset.get_node_features(node_type)
-        if features is None:
-            print(f"No features available for node type {node_type}")
-            return
-            
-        # Convert to numpy for easier manipulation
-        if isinstance(features, torch.Tensor):
-            features = features.numpy()
-            
-        # Plot feature distributions
-        n_features = min(features.shape[1], 10)  # Limit to 10 features
-        fig, axes = plt.subplots(n_features, 1, figsize=(10, 2*n_features))
-        
-        for i in range(n_features):
-            if n_features == 1:
-                ax = axes
-            else:
-                ax = axes[i]
-                
-            ax.hist(features[:, i], bins=30)
-            ax.set_title(f'Feature {i} Distribution')
-            ax.set_xlabel('Value')
-            ax.set_ylabel('Frequency')
-            
-        plt.tight_layout()
-        plt.savefig(f"./data/visualizations/{self.dataset.name}_{node_type}_features.png")
-        plt.close()
-
-
-# Example implementation for a specific dataset (DBLP)
-class DBLPDataset(HeterogeneousGraphDataset):
-    """DBLP dataset implementation"""
-    
-    def __init__(self, raw_dir='./data/raw', processed_dir='./data/processed'):
-        super().__init__('DBLP', raw_dir, processed_dir)
-        
-    def download(self):
-        """Download DBLP dataset"""
-        super().download()
-        # Specific implementation for DBLP
-        # Could use requests to download from source URL
-        
-    def process(self):
-        """Process DBLP dataset"""
-        print("Processing DBLP dataset...")
-        
-        # Define node types
-        self.node_types = ['author', 'paper', 'conference', 'term']
-        
-        # Define edge types (relations)
-        self.edge_types = [
-            ('author', 'writes', 'paper'),
-            ('paper', 'published_in', 'conference'),
-            ('paper', 'contains', 'term')
-        ]
-        
-        # Process node features (simplified example)
-        # In a real implementation, these would be loaded from files
-        num_authors = 4057
-        num_papers = 14328
-        num_conferences = 20
-        num_terms = 8789
-        
-        # Create dummy features for demonstration
-        self.node_features['author'] = torch.randn(num_authors, 334)
-        self.node_features['paper'] = torch.randn(num_papers, 4231)
-        self.node_features['conference'] = torch.randn(num_conferences, 50)
-        self.node_features['term'] = torch.randn(num_terms, 50)
-        
-        # Create dummy edge indices for demonstration
-        self.edge_indices[('author', 'writes', 'paper')] = torch.randint(
-            low=0, high=min(num_authors, num_papers), size=(2, 19645)
-        )
-        self.edge_indices[('paper', 'published_in', 'conference')] = torch.randint(
-            low=0, high=min(num_papers, num_conferences), size=(2, 14328)
-        )
-        self.edge_indices[('paper', 'contains', 'term')] = torch.randint(
-            low=0, high=min(num_papers, num_terms), size=(2, 88420)
-        )
-        
-        # Create dummy labels for author classification
-        self.node_labels['author'] = torch.randint(0, 4, (num_authors,))
-        
-        # Save processed data
-        self.save()
-
-
 # Usage example
 if __name__ == "__main__":
-    # Create visualization directory
-    os.makedirs("./data/visualizations", exist_ok=True)
-    
     # Initialize and load DBLP dataset
     dblp = DBLPDataset()
     dblp.load()
     
+    # Print dataset statistics
+    print("\nDBLP Dataset Statistics:")
+    print(f"Node types: {dblp.node_types}")
+    for ntype in dblp.node_types:
+        if ntype in dblp.node_features:
+            print(f"  {ntype}: {dblp.node_features[ntype].shape[0]} nodes, {dblp.node_features[ntype].shape[1]} features")
+    
+    print("\nEdge types:")
+    for etype in dblp.edge_types:
+        if etype in dblp.edge_indices:
+            print(f"  {etype}: {dblp.edge_indices[etype].shape[1]} edges")
+    
     # Create train/test splits for node classification
     author_splits = dblp.create_train_test_split('author')
-    print(f"Author classification splits: {len(author_splits['train'])} train, "
+    print(f"\nAuthor classification splits: {len(author_splits['train'])} train, "
           f"{len(author_splits['val'])} validation, {len(author_splits['test'])} test")
     
     # Create train/test splits for link prediction
     link_splits = dblp.create_link_prediction_split(('author', 'writes', 'paper'))
-    print(f"Link prediction splits: {link_splits['train'].shape[1]} train, "
+    print(f"\nLink prediction splits: {link_splits['train'].shape[1]} train, "
           f"{link_splits['val'].shape[1]} validation, {link_splits['test'].shape[1]} test")
-    
-    # Visualize graph statistics and structure
-    visualizer = GraphVisualizer(dblp)
-    visualizer.visualize_graph_statistics()
-    visualizer.visualize_subgraph()
-    visualizer.visualize_feature_distributions('author')
-
-
